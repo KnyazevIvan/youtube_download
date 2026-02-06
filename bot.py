@@ -62,6 +62,10 @@ CACHE_TTL = 600  # 10 минут
 # Кэш: (url, format_type, quality) -> {"path": str, "timestamp": float}
 file_cache = {}
 
+# Кэш Telegram file_id: (url, format_type, quality) -> telegram file_id
+# Повторная отправка по file_id — мгновенная, без скачивания и аплоада
+telegram_file_cache = {}
+
 
 def cache_get(url: str, format_type: str, quality: str = "") -> str | None:
     """Получить файл из кэша, если есть и не протух"""
@@ -113,8 +117,16 @@ def get_ydl_opts():
         "fragment_retries": 10,
         "file_access_retries": 5,
         "extractor_retries": 5,
-        "concurrent_fragment_downloads": 8,
         "http_chunk_size": 10485760,            # 10 MB
+        "external_downloader": "aria2c",
+        "external_downloader_args": {
+            "aria2c": [
+                "--min-split-size=1M",
+                "--max-connection-per-server=16",
+                "--max-concurrent-downloads=16",
+                "--split=16",
+            ]
+        },
         "throttledratelimit": 100000,           # переподключение при <100 KB/s
         "extractor_args": {
             "youtube": {
@@ -202,6 +214,7 @@ def download_media(url: str, output_path: str, format_type: str,
             "outtmpl": output_path,
             "merge_output_format": "mp4",
             "postprocessor_args": {
+                "merger": ["-c", "copy"],
                 "ffmpeg": ["-threads", "0"],
             },
         }
@@ -497,10 +510,40 @@ async def handle_callback(client: Client, callback: CallbackQuery):
         quality = ""
         dl_text = "Извлекаю аудио..."
 
-    # Проверяем кэш
+    # 1) Проверяем кэш Telegram file_id (мгновенная отправка)
+    tg_cache_key = (url, format_type, quality)
+    cached_file_id = telegram_file_cache.get(tg_cache_key)
+    if cached_file_id:
+        logger.info(f"Telegram file_id кэш-хит: {tg_cache_key}")
+        try:
+            if format_type == "video":
+                await client.send_video(
+                    chat_id=callback.message.chat.id,
+                    video=cached_file_id,
+                    caption=f"🎬 **{title}**",
+                    parse_mode=ParseMode.MARKDOWN,
+                    supports_streaming=True,
+                )
+            else:
+                await client.send_audio(
+                    chat_id=callback.message.chat.id,
+                    audio=cached_file_id,
+                    caption=f"🎵 **{title}**",
+                    parse_mode=ParseMode.MARKDOWN,
+                    title=title,
+                )
+            await callback.message.delete()
+            if user_id in user_data:
+                del user_data[user_id]
+            return
+        except Exception as e:
+            logger.warning(f"Ошибка отправки по file_id: {e}")
+            telegram_file_cache.pop(tg_cache_key, None)
+
+    # 2) Проверяем файловый кэш (файл на диске)
     cached_path = cache_get(url, format_type, quality)
     if cached_path:
-        logger.info(f"Кэш-хит: {cached_path}")
+        logger.info(f"Файловый кэш-хит: {cached_path}")
         await callback.message.edit_text(
             f"⚡ **Файл найден в кэше!**\n\n"
             f"📤 Загружаю в Telegram...",
@@ -513,7 +556,7 @@ async def handle_callback(client: Client, callback: CallbackQuery):
                     f"❌ Файл слишком большой: {format_size(file_size)}\nЛимит Telegram: 2 ГБ"
                 )
                 return
-            await _send_file(client, callback, cached_path, format_type, title)
+            await _send_file(client, callback, cached_path, format_type, title, tg_cache_key)
             await callback.message.delete()
             if user_id in user_data:
                 del user_data[user_id]
@@ -581,7 +624,7 @@ async def handle_callback(client: Client, callback: CallbackQuery):
             parse_mode=ParseMode.MARKDOWN
         )
 
-        await _send_file(client, callback, final_file, format_type, title)
+        await _send_file(client, callback, final_file, format_type, title, tg_cache_key)
 
         # Удаляем статусное сообщение
         await callback.message.delete()
@@ -606,10 +649,11 @@ async def handle_callback(client: Client, callback: CallbackQuery):
 
 
 async def _send_file(client: Client, callback: CallbackQuery,
-                     file_path: str, format_type: str, title: str):
-    """Отправка файла в Telegram"""
+                     file_path: str, format_type: str, title: str,
+                     tg_cache_key: tuple = None):
+    """Отправка файла в Telegram + кэширование file_id"""
     if format_type == "video":
-        await client.send_video(
+        msg = await client.send_video(
             chat_id=callback.message.chat.id,
             video=file_path,
             caption=f"🎬 **{title}**",
@@ -618,8 +662,12 @@ async def _send_file(client: Client, callback: CallbackQuery,
             progress=progress_callback,
             progress_args=(callback.message, "upload")
         )
+        # Сохраняем file_id для мгновенной повторной отправки
+        if tg_cache_key and msg.video:
+            telegram_file_cache[tg_cache_key] = msg.video.file_id
+            logger.info(f"Telegram file_id закэширован: {tg_cache_key}")
     else:
-        await client.send_audio(
+        msg = await client.send_audio(
             chat_id=callback.message.chat.id,
             audio=file_path,
             caption=f"🎵 **{title}**",
@@ -628,6 +676,10 @@ async def _send_file(client: Client, callback: CallbackQuery,
             progress=progress_callback,
             progress_args=(callback.message, "upload")
         )
+        # Сохраняем file_id для мгновенной повторной отправки
+        if tg_cache_key and msg.audio:
+            telegram_file_cache[tg_cache_key] = msg.audio.file_id
+            logger.info(f"Telegram file_id закэширован: {tg_cache_key}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -643,9 +695,9 @@ if __name__ == "__main__":
     print("=" * 50)
     print(f"📁 Папка загрузок: {os.path.abspath(DOWNLOAD_PATH)}")
     print("✨ Pyrogram MTProto - файлы до 2 ГБ")
-    print("🚀 Параллельная загрузка фрагментов (8x)")
+    print("🚀 aria2c — 16 соединений параллельно")
     print("📊 Прогресс-бар скачивания")
-    print("💾 Кэш файлов (10 мин)")
+    print("💾 Кэш файлов (10 мин) + Telegram file_id кэш")
     print("=" * 50)
     print("🚀 Бот запускается...")
     print()
