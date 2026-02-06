@@ -1,0 +1,9 @@
+services:
+  bot:
+    build: .
+    container_name: youtube-downloader-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./downloads:/app/downloads
