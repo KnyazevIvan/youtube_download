@@ -1,8 +1,8 @@
 FROM python:3.12-slim
 
-# Установка ffmpeg
+# Установка ffmpeg и gcc (нужен для сборки tgcrypto)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg && \
+    apt-get install -y --no-install-recommends ffmpeg gcc libc6-dev && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
